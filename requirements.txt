@@ -1,0 +1,4 @@
+python-telegram-bot==21.9
+qrcode[pil]==8.0
+Pillow==11.0.0
+pyzbar==0.1.9
