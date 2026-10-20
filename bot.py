@@ -3,12 +3,13 @@ import io
 import logging
 import os
 
+import cv2
+import numpy as np
 import qrcode
 from qrcode.constants import (
     ERROR_CORRECT_L, ERROR_CORRECT_M, ERROR_CORRECT_Q, ERROR_CORRECT_H
 )
 from PIL import Image
-from pyzbar.pyzbar import decode as decode_qr_image
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
@@ -61,7 +62,7 @@ def _generate_qr(text: str, size: int = 512, fill: str = "black",
     qr.add_data(text)
     qr.make(fit=True)
     img = qr.make_image(fill_color=fill, back_color=back)
-    if hasattr(img, "get_image"):          # qrcode wraps PIL images
+    if hasattr(img, "get_image"):
         img = img.get_image()
     img = img.resize((size, size), Image.Resampling.NEAREST)
     buf = io.BytesIO()
@@ -122,7 +123,6 @@ async def _send_qr(update: Update, context: ContextTypes.DEFAULT_TYPE,
         parse_mode="Markdown",
         reply_markup=_main_keyboard(),
     )
-    # Store the state keyed by message_id so multiple QRs can be customized
     context.user_data.setdefault("qr_store", {})[msg.message_id] = {
         "text": text, "size": size, "color": color, "ecc": ecc,
     }
@@ -259,11 +259,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             parse_mode="Markdown",
             reply_markup=_main_keyboard(),
         )
-        # Preserve state on the new message too
         store[new_msg.message_id] = state
 
 
-# ---------- Image handler (decode) ----------
+# ---------- Image handler (decode with OpenCV) ----------
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async with qr_semaphore:
         message = update.effective_message
@@ -279,29 +278,41 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 return
 
             file_bytes = await file.download_as_bytearray()
-            img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
 
-            results = decode_qr_image(img)
-            if not results:
-                # Retry with 2× upscale — helps small or slightly-blurred codes
-                w, h = img.size
-                if max(w, h) < 2000:
-                    img2 = img.resize((w * 2, h * 2), Image.Resampling.LANCZOS)
-                    results = decode_qr_image(img2)
+            # Convert bytes to an OpenCV image
+            np_arr = np.frombuffer(file_bytes, np.uint8)
+            img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-            if not results:
+            if img is None:
+                await message.reply_text("❌ Could not read that image.")
+                return
+
+            detector = cv2.QRCodeDetector()
+
+            # Try the original image first
+            data, points, _ = detector.detectAndDecode(img)
+
+            # Fallback: upscale grayscale for small/blurred codes
+            if not data:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                h, w = gray.shape
+                if max(h, w) < 2000:
+                    scale = 2.0
+                    gray = cv2.resize(
+                        gray, (int(w * scale), int(h * scale)),
+                        interpolation=cv2.INTER_LANCZOS4,
+                    )
+                data, points, _ = detector.detectAndDecode(gray)
+
+            if not data:
                 await message.reply_text(
                     "❌ No QR code detected. Try sending the image as a file "
-                    "(uncompressed) for better results."
+                    "(uncompressed) or use a clearer photo."
                 )
                 return
 
-            lines = []
-            for i, r in enumerate(results, 1):
-                payload = r.data.decode("utf-8", errors="replace")
-                lines.append(f"#{i} ({r.type}):\n{payload}")
+            await message.reply_text("🔍 Decoded QR code:\n\n" + data)
 
-            await message.reply_text("🔍 Decoded QR code(s):\n\n" + "\n\n".join(lines))
         except Exception:
             logger.exception("QR decode failed")
             await message.reply_text("❌ Could not decode that image.")
@@ -315,16 +326,13 @@ def main() -> None:
 
     app = Application.builder().token(token).build()
 
-    # Commands first (they take precedence over text handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("wifi", wifi_command))
     app.add_handler(CommandHandler("skip", skip_command))
 
-    # Inline buttons for customization
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Images (photos + image files) — for decoding
     app.add_handler(
         MessageHandler(
             (filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND,
@@ -332,7 +340,6 @@ def main() -> None:
         )
     )
 
-    # Plain text — for generation / WiFi flow
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("QR Code Bot starting in polling mode…")
